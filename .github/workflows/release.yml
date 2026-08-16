@@ -1,0 +1,115 @@
+name: Release
+
+# Builds standalone plate-ocr binaries for the platforms below and (on an actual "vX.Y.Z" tag
+# push) attaches them to the matching GitHub Release, so users can grab a single file from the
+# repo's Releases page and run it -- see install.sh for a script that automates the download.
+#
+# Only the portable, always-buildable backends are covered here:
+#   - cpu:    works everywhere (the ndarray backend), built for Linux/Windows/macOS(x86_64+arm64)
+#   - vulkan: AMD/other GPU acceleration without ROCm, built for Linux only
+# The default "rocm" backend needs the ROCm/HIP SDK and an AMD GPU, neither of which is available
+# on hosted CI runners, so it is intentionally not distributed as a prebuilt binary -- ROCm users
+# should still build from source (see README.md).
+"on":
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64-cpu
+            os: ubuntu-latest
+            features: cpu
+            apt_packages: ""
+            binary: plate-ocr
+          - name: linux-x86_64-vulkan
+            os: ubuntu-latest
+            features: vulkan
+            apt_packages: "libvulkan-dev"
+            binary: plate-ocr
+          - name: windows-x86_64-cpu
+            os: windows-latest
+            features: cpu
+            apt_packages: ""
+            binary: plate-ocr.exe
+          - name: macos-x86_64-cpu
+            os: macos-13
+            features: cpu
+            apt_packages: ""
+            binary: plate-ocr
+          - name: macos-arm64-cpu
+            os: macos-14
+            features: cpu
+            apt_packages: ""
+            binary: plate-ocr
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Install system dependencies
+        if: matrix.apt_packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_packages }}
+
+      - name: Build (release)
+        run: cargo build --release --no-default-features --features ${{ matrix.features }}
+
+      - name: Stage package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="staging/plate-ocr-${{ matrix.name }}"
+          mkdir -p "$stage"
+          cp "target/release/${{ matrix.binary }}" "$stage/"
+          cp import_onnx.py export_onnx.py README.md LICENSE "$stage/"
+          (cd staging && tar -czf "../plate-ocr-${{ matrix.name }}.tar.gz" "plate-ocr-${{ matrix.name }}")
+
+      - name: Stage package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="staging/plate-ocr-${{ matrix.name }}"
+          mkdir -p "$stage"
+          cp "target/release/${{ matrix.binary }}" "$stage/"
+          cp import_onnx.py export_onnx.py README.md LICENSE "$stage/"
+          (cd staging && 7z a "../plate-ocr-${{ matrix.name }}.zip" "plate-ocr-${{ matrix.name }}")
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plate-ocr-${{ matrix.name }}
+          path: |
+            plate-ocr-${{ matrix.name }}.tar.gz
+            plate-ocr-${{ matrix.name }}.zip
+          if-no-files-found: ignore
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            plate-ocr-${{ matrix.name }}.tar.gz
+            plate-ocr-${{ matrix.name }}.zip
+          fail_on_unmatched_files: false
