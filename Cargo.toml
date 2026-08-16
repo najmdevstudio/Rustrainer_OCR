@@ -3,7 +3,7 @@ name = "plate-ocr"
 version = "0.1.0"
 edition = "2024"
 description = "Pure-Rust CRNN (CNN + BiLSTM + CTC) OCR training/inference utility for license plates, with a GUI wizard and ONNX export."
-license = "MIT"
+license = "GPL-3.0-or-later"
 readme = "README.md"
 # TODO: point this at the real GitHub repository once the project is pushed there (also update
 # the same placeholder in install.sh and README.md).

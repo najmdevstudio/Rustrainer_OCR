@@ -273,4 +273,18 @@ RUN cargo build --release
 
 ## License
 
-GPLv3 — see [LICENSE](LICENSE).
+Rustrainer-OCR is free software: you can redistribute it and/or modify it under the terms of
+the GNU General Public License as published by the Free Software Foundation, either version 3
+of the License, or (at your option) any later version — see [LICENSE](LICENSE) for the full text.
+
+```
+Rustrainer-OCR  Copyright (C) 2026  Mohammad Najm
+This program comes with ABSOLUTELY NO WARRANTY; for details run `plate-ocr show w`.
+This is free software, and you are welcome to redistribute it
+under certain conditions; run `plate-ocr show c` for details.
+```
+
+This notice is printed automatically whenever the CLI is run from an interactive terminal; the
+GUI wizard shows the same information (plus the relevant license sections) in its **About** box.
+
+**Contact:** Mohammad Najm — <najm.devops@gmail.com> — <https://github.com/najmdevstudio/Rustrainer_OCR>

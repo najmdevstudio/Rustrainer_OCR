@@ -1,13 +1,34 @@
+// Rustrainer-OCR A GUI Utility to train/fine tune OCR Models written in Rust.
+// Copyright (C) 2026 Mohammad Najm
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Contact: Mohammad Najm <najm.devops@gmail.com>
+// https://github.com/najmdevstudio/Rustrainer_OCR
+
 mod backend;
 mod data;
 mod export;
 mod gui;
 mod inference;
 mod interop;
+mod license;
 mod model;
 mod scripts;
 mod training;
 
+use std::io::IsTerminal;
 use std::path::Path;
 
 use clap::{Parser, Subcommand};
@@ -67,10 +88,32 @@ enum Commands {
         #[arg(long, default_value = ".")]
         output_dir: String,
     },
+    /// Show parts of the GNU GPL: `show w` for the warranty disclaimer, `show c` for the
+    /// redistribution conditions (the same text printed by the startup notice's instructions).
+    Show {
+        part: ShowPart,
+    },
+}
+
+/// Which part of the license `show` should print.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ShowPart {
+    #[value(name = "w")]
+    W,
+    #[value(name = "c")]
+    C,
 }
 
 fn main() {
     env_logger::init();
+
+    // GPLv3's "How to Apply These Terms to Your New Programs": print a short notice when the
+    // program does terminal interaction and is being run interactively.
+    if std::io::stdout().is_terminal() {
+        println!("{}", license::short_notice());
+        println!();
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -111,6 +154,10 @@ fn main() {
         Some(Commands::ExtractScripts { output_dir }) => {
             run_extract_scripts(&output_dir);
         }
+        Some(Commands::Show { part }) => match part {
+            ShowPart::W => println!("{}", license::warranty_section()),
+            ShowPart::C => println!("{}", license::conditions_section()),
+        },
     }
 }
 

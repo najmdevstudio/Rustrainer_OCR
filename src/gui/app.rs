@@ -1,3 +1,22 @@
+// Rustrainer-OCR A GUI Utility to train/fine tune OCR Models written in Rust.
+// Copyright (C) 2026 Mohammad Najm
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// Contact: Mohammad Najm <najm.devops@gmail.com>
+// https://github.com/najmdevstudio/Rustrainer_OCR
+
 //! The four-screen training wizard: choose mode -> parameters -> live progress -> result.
 
 use std::sync::mpsc::{self, Receiver};
@@ -24,6 +43,7 @@ pub struct WizardApp {
     mode: Mode,
     params: Params,
     error: Option<String>,
+    show_about: bool,
 
     events: Option<Receiver<GuiEvent>>,
     logs: Vec<String>,
@@ -44,6 +64,7 @@ impl Default for WizardApp {
             mode: Mode::NewTraining,
             params: Params::defaults_for(Mode::NewTraining),
             error: None,
+            show_about: false,
             events: None,
             logs: Vec::new(),
             train_series: Vec::new(),
@@ -357,11 +378,68 @@ impl WizardApp {
             });
         });
     }
+
+    /// GPLv3's suggested "about box" for GUI programs: the short no-warranty/free-to-redistribute
+    /// notice, contact info, and the same warranty/conditions excerpts as the CLI's `show w`/`show c`.
+    fn ui_about_window(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+
+        let mut open = true;
+        egui::Window::new(format!("About {}", crate::license::PROGRAM_NAME))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.heading(crate::license::PROGRAM_NAME);
+                ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                ui.add_space(6.0);
+                ui.label(crate::license::COPYRIGHT_LINE);
+                ui.add_space(10.0);
+                ui.label("This program comes with ABSOLUTELY NO WARRANTY; see \"Warranty\" below.");
+                ui.label(
+                    "This is free software, and you are welcome to redistribute it under certain conditions; see \"Conditions\" below.",
+                );
+                ui.add_space(10.0);
+                ui.label(format!("Contact: {}", crate::license::CONTACT));
+                ui.add_space(12.0);
+
+                egui::CollapsingHeader::new("Warranty (GPLv3 sections 15-17)").show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                        ui.label(RichText::new(crate::license::warranty_section()).monospace());
+                    });
+                });
+                egui::CollapsingHeader::new("Redistribution Conditions (GPLv3 sections 4-6)").show(
+                    ui,
+                    |ui| {
+                        egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                            ui.label(
+                                RichText::new(crate::license::conditions_section()).monospace(),
+                            );
+                        });
+                    },
+                );
+
+                ui.add_space(12.0);
+                ui.hyperlink_to("Full license text", "https://www.gnu.org/licenses/gpl-3.0.html");
+            });
+        self.show_about = open;
+    }
 }
 
 impl eframe::App for WizardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+
+        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("About").clicked() {
+                    self.show_about = true;
+                }
+            });
+        });
 
         match self.screen {
             Screen::ChooseMode => self.ui_choose_mode(ctx),
@@ -369,5 +447,7 @@ impl eframe::App for WizardApp {
             Screen::Progress => self.ui_progress(ctx),
             Screen::Result => self.ui_result(ctx),
         }
+
+        self.ui_about_window(ctx);
     }
 }
