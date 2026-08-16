@@ -1,4 +1,4 @@
-# plate-ocr
+# Rustrainer-OCR
 
 A pure-Rust OCR training and inference utility for license plate recognition, built with [Burn](https://burn.dev) deep learning framework. Trains a CRNN (CNN + BiLSTM + CTC) model and supports ONNX export.
 
