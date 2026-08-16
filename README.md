@@ -24,7 +24,7 @@ only for the ONNX-related features described further down).
 ### Quick Install (Linux/macOS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/najmdevstudio/Rustrainer_OCR/main/install.sh | sh
 ```
 
 This detects your OS/CPU, downloads the matching `plate-ocr` binary, and installs it to
@@ -33,8 +33,6 @@ application-menu entry so the GUI wizard shows up like any other installed app. 
 at the top of [`install.sh`](install.sh) for every option it accepts (pinning a version, the
 `vulkan` backend instead of `cpu`, skipping the desktop entry, etc).
 
-> **Note:** `OWNER/REPO` above (and the matching placeholder inside `install.sh` and
-> `Cargo.toml`) needs to be updated to this project's actual GitHub repository once it has one.
 
 ### Manual Download
 
