@@ -27,12 +27,13 @@ and src/interop/pytorch_import.rs).
 Usage:
     python import_onnx.py <input.onnx> <output.pt>
 
-The ONNX graph is expected to follow this project's fixed CRNN architecture (see
-src/model/crnn.rs / export_onnx.py): 4x (Conv2d + BatchNormalization), a bidirectional LSTM, and
-a final linear layer. Weight/bias tensors are located positionally (by walking the graph's nodes
-and using each operator's own fixed input order) rather than by initializer name, since exporter
--assigned initializer names aren't guaranteed to be human-readable or stable across PyTorch/ONNX
-versions.
+The ONNX graph must match one of plate-ocr's two supported architectures (see
+src/model/{crnn,conv_ctc}.rs / export_onnx.py), auto-detected from the graph's own structure:
+  - CRNN:     4x (Conv2d + BatchNormalization), a bidirectional LSTM, then 1 final Linear layer.
+  - Conv-CTC: 4x (Conv2d + BatchNormalization), then 2 sequential Linear layers, no LSTM.
+Weight/bias tensors are located positionally (by walking the graph's nodes and using each
+operator's own fixed input order) rather than by initializer name, since exporter-assigned
+initializer names aren't guaranteed to be human-readable or stable across PyTorch/ONNX versions.
 
 Notes on ONNX's LSTM convention (see https://onnx.ai/onnx/operators/onnx__LSTM.html):
   - Gates are packed in "i, o, f, c" order (input, output, forget, cell), whereas PyTorch's
@@ -73,6 +74,30 @@ def matmul_weight(node, initializers: dict) -> np.ndarray:
     raise ValueError(f"Could not find a constant weight operand for MatMul node '{node.name}'.")
 
 
+def extract_linear(kind: str, node, prefix: str, graph, initializers: dict, state_dict: dict) -> None:
+    """Reads a `Linear`-equivalent node (`MatMul` (+ trailing `Add` for the bias) or `Gemm`) into
+    `state_dict[f"{prefix}.weight"]` / `state_dict[f"{prefix}.bias"]`."""
+    if kind == "matmul":
+        weight = matmul_weight(node, initializers)
+        # The exporter constant-folds `weight.t()` into the initializer, i.e. it is already
+        # `[in, out]`; PyTorch's `nn.Linear.weight` expects `[out, in]`.
+        state_dict[f"{prefix}.weight"] = torch.from_numpy(weight.T.copy())
+        bias = find_bias_for(node.output[0], graph, initializers)
+        if bias is not None:
+            state_dict[f"{prefix}.bias"] = torch.from_numpy(bias.copy())
+    else:
+        weight = initializers[node.input[1]]
+        trans_b = next((attr.i for attr in node.attribute if attr.name == "transB"), 0)
+        if not trans_b:
+            weight = weight.T
+        state_dict[f"{prefix}.weight"] = torch.from_numpy(weight.copy())
+        if len(node.input) > 2:
+            state_dict[f"{prefix}.bias"] = torch.from_numpy(initializers[node.input[2]].copy())
+
+    if f"{prefix}.bias" not in state_dict:
+        state_dict[f"{prefix}.bias"] = torch.zeros(state_dict[f"{prefix}.weight"].shape[0])
+
+
 def convert(input_path: str, output_path: str) -> None:
     model = onnx.load(input_path)
     graph = model.graph
@@ -83,8 +108,7 @@ def convert(input_path: str, output_path: str) -> None:
     conv_index = 0
     bn_index = 0
     lstm_node = None
-    gemm_node = None
-    matmul_node = None
+    linear_nodes: list[tuple[str, object]] = []  # [("gemm"|"matmul", node), ...] in graph order
 
     for node in graph.node:
         if node.op_type == "Conv":
@@ -101,14 +125,15 @@ def convert(input_path: str, output_path: str) -> None:
         elif node.op_type == "LSTM":
             lstm_node = node
         elif node.op_type == "Gemm":
-            gemm_node = node
-        elif node.op_type == "MatMul" and matmul_node is None:
-            matmul_node = node
+            linear_nodes.append(("gemm", node))
+        elif node.op_type == "MatMul":
+            linear_nodes.append(("matmul", node))
 
     if conv_index != 4:
         raise ValueError(
-            f"Expected 4 Conv nodes (plate-ocr's fixed CRNN architecture), found {conv_index} in "
-            f"'{input_path}'. Is this an ONNX export of a compatible model?"
+            f"Expected 4 Conv nodes (plate-ocr's CRNN and Conv-CTC architectures both use a fixed "
+            f"4-layer CNN backbone), found {conv_index} in '{input_path}'. Is this an ONNX export "
+            f"of a compatible model? See README.md for what plate-ocr's --pretrained import supports."
         )
     if bn_index not in (0, 4):
         raise ValueError(
@@ -125,59 +150,58 @@ def convert(input_path: str, output_path: str) -> None:
         # (gamma=1, beta=0, mean=0, var=1), so the merged model computes identically.
         print("No separate BatchNormalization nodes found; assuming they were fused into the Conv weights.")
 
-    if lstm_node is None:
-        raise ValueError(f"No LSTM node found in '{input_path}'.")
+    if lstm_node is not None:
+        architecture = "crnn_bilstm"
+        if len(linear_nodes) != 1:
+            raise ValueError(
+                f"'{input_path}' has an LSTM node (matching plate-ocr's CRNN architecture) but "
+                f"{len(linear_nodes)} MatMul/Gemm node(s) instead of the 1 expected for CRNN's final "
+                f"linear layer. Is this a mix of architectures, or an unsupported variant?"
+            )
 
-    w = initializers[lstm_node.input[1]]  # [num_directions, 4*hidden, input]
-    r = initializers[lstm_node.input[2]]  # [num_directions, 4*hidden, hidden]
-    b = initializers[lstm_node.input[3]] if len(lstm_node.input) > 3 and lstm_node.input[3] else None
+        w = initializers[lstm_node.input[1]]  # [num_directions, 4*hidden, input]
+        r = initializers[lstm_node.input[2]]  # [num_directions, 4*hidden, hidden]
+        b = initializers[lstm_node.input[3]] if len(lstm_node.input) > 3 and lstm_node.input[3] else None
 
-    num_directions, four_hidden, _input_size = w.shape
-    hidden = four_hidden // 4
-    if num_directions != 2:
-        raise ValueError(f"Expected a bidirectional LSTM (2 directions), found {num_directions}.")
+        num_directions, four_hidden, _input_size = w.shape
+        hidden = four_hidden // 4
+        if num_directions != 2:
+            raise ValueError(f"Expected a bidirectional LSTM (2 directions), found {num_directions}.")
 
-    for direction_index, suffix in enumerate(["", "_reverse"]):
-        weight_ih = reorder_iofc_to_ifgo(w[direction_index], hidden)
-        weight_hh = reorder_iofc_to_ifgo(r[direction_index], hidden)
-        state_dict[f"lstm.weight_ih_l0{suffix}"] = torch.from_numpy(weight_ih.copy())
-        state_dict[f"lstm.weight_hh_l0{suffix}"] = torch.from_numpy(weight_hh.copy())
+        for direction_index, suffix in enumerate(["", "_reverse"]):
+            weight_ih = reorder_iofc_to_ifgo(w[direction_index], hidden)
+            weight_hh = reorder_iofc_to_ifgo(r[direction_index], hidden)
+            state_dict[f"lstm.weight_ih_l0{suffix}"] = torch.from_numpy(weight_ih.copy())
+            state_dict[f"lstm.weight_hh_l0{suffix}"] = torch.from_numpy(weight_hh.copy())
 
-        if b is not None:
-            wb, rb = np.split(b[direction_index], 2)  # each [4*hidden]
-            state_dict[f"lstm.bias_ih_l0{suffix}"] = torch.from_numpy(reorder_iofc_to_ifgo(wb, hidden).copy())
-            state_dict[f"lstm.bias_hh_l0{suffix}"] = torch.from_numpy(reorder_iofc_to_ifgo(rb, hidden).copy())
-        else:
-            state_dict[f"lstm.bias_ih_l0{suffix}"] = torch.zeros(4 * hidden)
-            state_dict[f"lstm.bias_hh_l0{suffix}"] = torch.zeros(4 * hidden)
+            if b is not None:
+                wb, rb = np.split(b[direction_index], 2)  # each [4*hidden]
+                state_dict[f"lstm.bias_ih_l0{suffix}"] = torch.from_numpy(reorder_iofc_to_ifgo(wb, hidden).copy())
+                state_dict[f"lstm.bias_hh_l0{suffix}"] = torch.from_numpy(reorder_iofc_to_ifgo(rb, hidden).copy())
+            else:
+                state_dict[f"lstm.bias_ih_l0{suffix}"] = torch.zeros(4 * hidden)
+                state_dict[f"lstm.bias_hh_l0{suffix}"] = torch.zeros(4 * hidden)
 
-    # Final linear head: PyTorch's `nn.Linear` on a 3D input (our LSTM output, [batch, time,
-    # features]) is typically exported as `MatMul` (+ `Add` for the bias) rather than `Gemm`
-    # (which the ONNX spec restricts to rank-2 inputs); both are handled here.
-    if matmul_node is not None:
-        weight = matmul_weight(matmul_node, initializers)
-        # The exporter constant-folds `weight.t()` into the initializer, i.e. it is already
-        # `[in, out]`; PyTorch's `nn.Linear.weight` expects `[out, in]`.
-        state_dict["linear.weight"] = torch.from_numpy(weight.T.copy())
-        bias = find_bias_for(matmul_node.output[0], graph, initializers)
-        if bias is not None:
-            state_dict["linear.bias"] = torch.from_numpy(bias.copy())
-    elif gemm_node is not None:
-        weight = initializers[gemm_node.input[1]]
-        trans_b = next((attr.i for attr in gemm_node.attribute if attr.name == "transB"), 0)
-        if not trans_b:
-            weight = weight.T
-        state_dict["linear.weight"] = torch.from_numpy(weight.copy())
-        if len(gemm_node.input) > 2:
-            state_dict["linear.bias"] = torch.from_numpy(initializers[gemm_node.input[2]].copy())
+        # Final linear head: PyTorch's `nn.Linear` on a 3D input (our LSTM output, [batch, time,
+        # features]) is typically exported as `MatMul` (+ `Add` for the bias) rather than `Gemm`
+        # (which the ONNX spec restricts to rank-2 inputs); both are handled here.
+        kind, node = linear_nodes[0]
+        extract_linear(kind, node, "linear", graph, initializers, state_dict)
     else:
-        raise ValueError(f"No MatMul/Gemm node found for the final linear layer in '{input_path}'.")
-
-    if "linear.bias" not in state_dict:
-        state_dict["linear.bias"] = torch.zeros(state_dict["linear.weight"].shape[0])
+        if len(linear_nodes) != 2:
+            raise ValueError(
+                f"'{input_path}' doesn't match either of plate-ocr's supported architectures: CRNN "
+                f"needs a bidirectional LSTM node (none found here); Conv-CTC needs exactly 2 "
+                f"sequential MatMul/Gemm nodes for its FC head (found {len(linear_nodes)}). This "
+                f"project's --pretrained import only supports re-importing an ONNX file (or matching "
+                f"PyTorch checkpoint) that this same tool originally exported — see README.md."
+            )
+        architecture = "conv_ctc"
+        extract_linear(*linear_nodes[0], "fc1", graph, initializers, state_dict)
+        extract_linear(*linear_nodes[1], "fc2", graph, initializers, state_dict)
 
     torch.save(state_dict, output_path)
-    print(f"Converted '{input_path}' -> '{output_path}' ({len(state_dict)} tensors).")
+    print(f"Converted '{input_path}' -> '{output_path}' ({len(state_dict)} tensors, architecture={architecture}).")
 
 
 if __name__ == "__main__":

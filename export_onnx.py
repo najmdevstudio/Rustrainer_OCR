@@ -23,8 +23,9 @@ Companion script for plate-ocr: loads exported Burn weights and produces an ONNX
 Usage:
     python export_onnx.py <weights_dir> [--output plate_ocr.onnx]
 
-The <weights_dir> must contain manifest.json and the .bin weight files
-produced by `plate-ocr export`.
+The <weights_dir> must contain manifest.json and the .bin weight files produced by
+`plate-ocr export`. manifest.json's top-level "architecture" field ("crnn_bilstm" or "conv_ctc",
+see src/model/architecture.rs) selects which of the two PyTorch mirror classes below is used.
 """
 
 import argparse
@@ -37,9 +38,11 @@ import torch
 import torch.nn as nn
 
 
-# ── Architecture (must mirror src/model/crnn.rs exactly) ──────────────────────
+# ── Architectures (must mirror src/model/{crnn,conv_ctc}.rs exactly) ──────────
 
 class CrnnOcr(nn.Module):
+    """CNN backbone + bidirectional LSTM + linear classifier (see src/model/crnn.rs)."""
+
     def __init__(self, num_classes: int = 37, lstm_hidden: int = 256):
         super().__init__()
         self.conv1 = nn.Conv2d(1, 64, 3, padding=1)
@@ -91,6 +94,57 @@ class CrnnOcr(nn.Module):
         return x
 
 
+class ConvCtcOcr(nn.Module):
+    """CNN backbone + 2-layer FC head, no recurrent layer (see src/model/conv_ctc.rs). Shares
+    the exact same backbone as `CrnnOcr` above; only the head differs."""
+
+    def __init__(self, num_classes: int = 37, fc_hidden: int = 256):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 64, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.pool1 = nn.MaxPool2d(2, 2)
+
+        self.conv2 = nn.Conv2d(64, 128, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(128)
+        self.pool2 = nn.MaxPool2d(2, 2)
+
+        self.conv3 = nn.Conv2d(128, 256, 3, padding=1)
+        self.bn3 = nn.BatchNorm2d(256)
+
+        self.conv4 = nn.Conv2d(256, 256, 3, padding=1)
+        self.bn4 = nn.BatchNorm2d(256)
+        self.pool4 = nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1))
+
+        # After CNN: [batch, 256, 4, 32] → reshape to [batch, 32, 1024]
+        self.fc1 = nn.Linear(256 * 4, fc_hidden)
+        self.fc2 = nn.Linear(fc_hidden, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch, 1, 32, 128]
+        x = self.pool1(torch.relu(self.bn1(self.conv1(x))))
+        x = self.pool2(torch.relu(self.bn2(self.conv2(x))))
+        x = torch.relu(self.bn3(self.conv3(x)))
+        x = self.pool4(torch.relu(self.bn4(self.conv4(x))))
+
+        # x: [batch, 256, 4, 32]
+        batch, channels, height, width = x.size()
+        # Permute to [batch, width, channels*height]
+        x = x.permute(0, 3, 1, 2).contiguous()
+        x = x.view(batch, width, channels * height)
+
+        # Per-timestep MLP head (replaces the BiLSTM in `CrnnOcr`)
+        x = torch.relu(self.fc1(x))
+        x = self.fc2(x)
+        x = torch.log_softmax(x, dim=2)
+
+        # Transpose to [time, batch, classes] for CTC convention
+        x = x.permute(1, 0, 2)
+        return x
+
+
+ARCHITECTURES = {"crnn_bilstm": CrnnOcr, "conv_ctc": ConvCtcOcr}
+
+
 # ── Weight loading ────────────────────────────────────────────────────────────
 
 def load_bin(path: Path, shape: list[int]) -> np.ndarray:
@@ -103,7 +157,19 @@ def load_bin(path: Path, shape: list[int]) -> np.ndarray:
     return np.array(values, dtype=np.float32).reshape(shape)
 
 
-def load_weights(weights_dir: str, model: CrnnOcr) -> None:
+def load_manifest(weights_dir: str) -> tuple[str, list[dict]]:
+    """Reads manifest.json, returning `(architecture_id, tensor_entries)`. Accepts both the
+    current `{"architecture": ..., "tensors": [...]}` format and the older plain-list format
+    (implicitly "crnn_bilstm", the only architecture that format ever described).
+    """
+    with open(Path(weights_dir) / "manifest.json") as f:
+        manifest = json.load(f)
+    if isinstance(manifest, list):
+        return "crnn_bilstm", manifest
+    return manifest["architecture"], manifest["tensors"]
+
+
+def load_weights(weights_dir: str, model: nn.Module, tensors: list[dict]) -> None:
     """Load exported weights (manifest.json + raw little-endian .bin files, produced by
     `plate-ocr export`) into the PyTorch model.
 
@@ -113,13 +179,11 @@ def load_weights(weights_dir: str, model: CrnnOcr) -> None:
     so loading is a direct 1:1 assignment.
     """
     wdir = Path(weights_dir)
-    with open(wdir / "manifest.json") as f:
-        manifest = json.load(f)
 
     state = model.state_dict()
     manifest_names = set()
 
-    for entry in manifest:
+    for entry in tensors:
         name, filename, shape = entry["name"], entry["file"], entry["shape"]
         manifest_names.add(name)
         tensor = torch.from_numpy(load_bin(wdir / filename, shape))
@@ -146,14 +210,21 @@ def load_weights(weights_dir: str, model: CrnnOcr) -> None:
         raise ValueError(f"Missing tensor(s) in manifest '{wdir / 'manifest.json'}': {missing}")
 
     model.load_state_dict(state)
-    print(f"Loaded {len(manifest)} parameter tensor(s) from {weights_dir}")
+    print(f"Loaded {len(tensors)} parameter tensor(s) from {weights_dir}")
 
 
 # ── ONNX export ──────────────────────────────────────────────────────────────
 
 def export(weights_dir: str, output_path: str) -> None:
-    model = CrnnOcr()
-    load_weights(weights_dir, model)
+    architecture, tensors = load_manifest(weights_dir)
+    if architecture not in ARCHITECTURES:
+        raise ValueError(
+            f"Unknown architecture '{architecture}' in manifest.json (expected one of "
+            f"{sorted(ARCHITECTURES)}). Was this exported by a newer/incompatible version of plate-ocr?"
+        )
+    print(f"Architecture: {architecture}")
+    model = ARCHITECTURES[architecture]()
+    load_weights(weights_dir, model, tensors)
     model.eval()
 
     dummy_input = torch.randn(1, 1, 32, 128)

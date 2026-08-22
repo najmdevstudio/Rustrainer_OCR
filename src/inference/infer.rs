@@ -23,14 +23,33 @@ use burn::module::Module;
 
 use crate::data::dataset::{IMG_HEIGHT, IMG_WIDTH};
 use crate::data::vocab;
-use crate::model::crnn::{CrnnOcr, CrnnOcrConfig};
+use crate::model::crnn::CrnnOcrConfig;
+use crate::model::conv_ctc::ConvCtcOcrConfig;
+use crate::model::{Architecture, OcrModel};
 
-pub fn load_model<B: Backend>(model_path: &str, device: &B::Device) -> CrnnOcr<B> {
-    let config = CrnnOcrConfig::new();
-    let model = config.init::<B>(device);
-    model
-        .load_file(model_path, &CompactRecorder::new(), device)
-        .expect("Failed to load model checkpoint")
+/// Loads a Burn checkpoint saved by `plate-ocr train`/`train --pretrained ...`, auto-detecting
+/// which architecture it is via the small sidecar file `crate::model::architecture` writes next
+/// to every checkpoint (defaulting to [`Architecture::CrnnBiLstm`] for checkpoints saved before
+/// that sidecar existed).
+pub fn load_model<B: Backend>(model_path: &str, device: &B::Device) -> Result<OcrModel<B>, String> {
+    let architecture = Architecture::read_sidecar(model_path);
+    let model = match architecture {
+        Architecture::CrnnBiLstm => {
+            let model = CrnnOcrConfig::new()
+                .init::<B>(device)
+                .load_file(model_path, &CompactRecorder::new(), device)
+                .map_err(|e| format!("Failed to load checkpoint '{model_path}': {e}"))?;
+            OcrModel::CrnnBiLstm(model)
+        }
+        Architecture::ConvCtc => {
+            let model = ConvCtcOcrConfig::new()
+                .init::<B>(device)
+                .load_file(model_path, &CompactRecorder::new(), device)
+                .map_err(|e| format!("Failed to load checkpoint '{model_path}': {e}"))?;
+            OcrModel::ConvCtc(model)
+        }
+    };
+    Ok(model)
 }
 
 pub fn preprocess_image<B: Backend>(image_path: &str, device: &B::Device) -> Tensor<B, 4> {
@@ -50,7 +69,7 @@ pub fn preprocess_image<B: Backend>(image_path: &str, device: &B::Device) -> Ten
     Tensor::from_data(data, device)
 }
 
-pub fn recognize<B: Backend>(model: &CrnnOcr<B>, image_path: &str, device: &B::Device) -> String {
+pub fn recognize<B: Backend>(model: &OcrModel<B>, image_path: &str, device: &B::Device) -> String {
     let image = preprocess_image::<B>(image_path, device);
     let log_probs = model.forward(image);
     // log_probs: [time=32, batch=1, classes=37]

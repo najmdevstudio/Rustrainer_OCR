@@ -25,6 +25,7 @@ mod inference;
 mod interop;
 mod license;
 mod model;
+mod pydeps;
 mod scripts;
 mod training;
 
@@ -58,13 +59,20 @@ enum Commands {
         #[arg(long, default_value = "checkpoints")]
         output_dir: String,
         /// Path to a pretrained model to fine-tune: a Burn checkpoint (default), a PyTorch
-        /// state dict (.pt/.pth), or an ONNX model (.onnx, requires Python + onnx/numpy/torch).
-        /// If omitted, trains from scratch with random initialization.
+        /// state dict (.pt/.pth), or an ONNX model (.onnx, requires Python + onnx/numpy/torch;
+        /// missing packages are installed automatically). If omitted, trains from scratch with
+        /// random initialization.
         #[arg(long)]
         pretrained: Option<String>,
-        /// Freeze CNN backbone layers during fine-tuning (only train LSTM + linear head).
+        /// Freeze CNN backbone layers during fine-tuning (only train the head: LSTM+linear, or
+        /// the FC layers for --architecture conv-ctc).
         #[arg(long, default_value_t = false)]
         freeze_backbone: bool,
+        /// Which architecture to train from scratch. Ignored when --pretrained is set: the
+        /// architecture is auto-detected from that file instead (and shown in the log/GUI
+        /// before training starts).
+        #[arg(long, value_enum, default_value = "crnn")]
+        architecture: CliArchitecture,
     },
     /// Run inference on a single plate image.
     Infer {
@@ -104,8 +112,30 @@ enum ShowPart {
     C,
 }
 
+/// CLI spelling of `model::Architecture` (see the `Train` subcommand's `--architecture` flag).
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum CliArchitecture {
+    #[value(name = "crnn")]
+    Crnn,
+    #[value(name = "conv-ctc")]
+    ConvCtc,
+}
+
+impl From<CliArchitecture> for model::Architecture {
+    fn from(value: CliArchitecture) -> Self {
+        match value {
+            CliArchitecture::Crnn => model::Architecture::CrnnBiLstm,
+            CliArchitecture::ConvCtc => model::Architecture::ConvCtc,
+        }
+    }
+}
+
 fn main() {
-    env_logger::init();
+    // Default to showing informational progress (dataset loading, architecture
+    // detection/selection, Python dependency checks, ...) even when the user hasn't set
+    // RUST_LOG themselves — silence-until-a-cryptic-final-error is exactly what makes failures
+    // hard to diagnose. RUST_LOG, if set, still takes priority as usual.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // GPLv3's "How to Apply These Terms to Your New Programs": print a short notice when the
     // program does terminal interaction and is being run interactively.
@@ -131,6 +161,7 @@ fn main() {
             output_dir,
             pretrained,
             freeze_backbone,
+            architecture,
         }) => {
             let config = training::train::TrainConfig::new(data_dir)
                 .with_num_epochs(epochs)
@@ -138,7 +169,8 @@ fn main() {
                 .with_learning_rate(lr)
                 .with_output_dir(output_dir)
                 .with_pretrained(pretrained)
-                .with_freeze_backbone(freeze_backbone);
+                .with_freeze_backbone(freeze_backbone)
+                .with_architecture(architecture.into());
 
             run_training(config);
         }
@@ -163,19 +195,36 @@ fn main() {
 
 fn run_training(config: training::train::TrainConfig) {
     let device = backend::device();
-    training::train::run::<backend::TrainBackend>(config, device);
+    match training::train::run::<backend::TrainBackend>(config, device) {
+        Ok(message) => println!("{message}"),
+        Err(message) => {
+            log::error!("{message}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn run_inference(model_path: &str, image_path: &str) {
     let device = backend::device();
-    let model = inference::infer::load_model::<backend::InferBackend>(model_path, &device);
-    let result = inference::infer::recognize(&model, image_path, &device);
-    println!("Recognized plate: {}", result);
+    match inference::infer::load_model::<backend::InferBackend>(model_path, &device) {
+        Ok(model) => {
+            println!("Loaded {} model from {model_path}", model.architecture());
+            let result = inference::infer::recognize(&model, image_path, &device);
+            println!("Recognized plate: {}", result);
+        }
+        Err(message) => {
+            log::error!("Failed to load model '{model_path}': {message}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn run_export(model_path: &str, output_dir: &str) {
     let device = backend::device();
-    export::onnx::export_weights::<backend::InferBackend>(model_path, output_dir, &device);
+    if let Err(message) = export::onnx::export_weights::<backend::InferBackend>(model_path, output_dir, &device) {
+        log::error!("Failed to export '{model_path}': {message}");
+        std::process::exit(1);
+    }
 }
 
 fn run_extract_scripts(output_dir: &str) {

@@ -25,6 +25,8 @@ use std::time::Duration;
 use eframe::egui::{self, Color32, RichText};
 use egui_plot::{Line, Plot, PlotPoints};
 
+use crate::model::Architecture;
+
 use super::params::{Mode, Params};
 use super::progress::{GuiEvent, Phase};
 use super::worker;
@@ -54,6 +56,9 @@ pub struct WizardApp {
     epoch: usize,
     num_epochs: usize,
     fraction: f32,
+    /// Which architecture was detected (fine-tuning) or selected (new training), once known —
+    /// shown at the top of the progress screen, before training actually starts changing it.
+    architecture: Option<String>,
     outcome: Option<Result<String, String>>,
 }
 
@@ -74,6 +79,7 @@ impl Default for WizardApp {
             epoch: 0,
             num_epochs: 0,
             fraction: 0.0,
+            architecture: None,
             outcome: None,
         }
     }
@@ -95,6 +101,9 @@ impl WizardApp {
                         let overflow = self.logs.len() - MAX_LOG_LINES;
                         self.logs.drain(0..overflow);
                     }
+                }
+                GuiEvent::Architecture(label) => {
+                    self.architecture = Some(label);
                 }
                 GuiEvent::Progress {
                     epoch,
@@ -137,6 +146,7 @@ impl WizardApp {
                 self.epoch = 0;
                 self.num_epochs = self.params.epochs;
                 self.fraction = 0.0;
+                self.architecture = None;
                 self.outcome = None;
 
                 let config = self.params.to_train_config();
@@ -238,6 +248,26 @@ impl WizardApp {
                     }
                     ui.end_row();
 
+                    if mode == Mode::NewTraining {
+                        ui.label("Architecture:");
+                        egui::ComboBox::new("architecture_combo", "")
+                            .selected_text(self.params.architecture.label())
+                            .show_ui(ui, |ui| {
+                                for architecture in Architecture::ALL {
+                                    ui.selectable_value(
+                                        &mut self.params.architecture,
+                                        architecture,
+                                        architecture.label(),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Freeze CNN backbone:");
+                        ui.checkbox(&mut self.params.freeze_backbone, "only train the head");
+                        ui.end_row();
+                    }
+
                     if mode == Mode::FineTuning {
                         ui.label("Pretrained model (checkpoint / .pt / .onnx):");
                         ui.text_edit_singleline(&mut self.params.pretrained);
@@ -251,11 +281,12 @@ impl WizardApp {
                         }
                         ui.end_row();
 
+                        ui.label("Architecture:");
+                        ui.label("auto-detected from the file above once training starts");
+                        ui.end_row();
+
                         ui.label("Freeze CNN backbone:");
-                        ui.checkbox(
-                            &mut self.params.freeze_backbone,
-                            "only train LSTM + linear head",
-                        );
+                        ui.checkbox(&mut self.params.freeze_backbone, "only train the head");
                         ui.end_row();
                     }
                 });
@@ -282,6 +313,15 @@ impl WizardApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading(format!("Training in progress — {}", self.mode.label()));
+            ui.add_space(4.0);
+            match &self.architecture {
+                Some(architecture) => {
+                    ui.label(RichText::new(format!("Architecture: {architecture}")).strong());
+                }
+                None => {
+                    ui.label(RichText::new("Architecture: detecting…").weak());
+                }
+            }
             ui.add_space(8.0);
 
             let text = if self.num_epochs > 0 {
@@ -359,9 +399,20 @@ impl WizardApp {
                         ui.add_space(10.0);
                         ui.heading("Training failed");
                         ui.add_space(8.0);
-                        egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
-                            ui.label(message);
-                        });
+                        egui::Frame::new()
+                            .fill(Color32::from_rgb(40, 20, 20))
+                            .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(200, 70, 70)))
+                            .inner_margin(10)
+                            .show(ui, |ui| {
+                                ui.set_width(560.0);
+                                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(message)
+                                            .monospace()
+                                            .color(Color32::from_rgb(255, 150, 150)),
+                                    );
+                                });
+                            });
                     }
                     None => {
                         ui.label("Unknown result.");

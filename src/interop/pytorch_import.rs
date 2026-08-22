@@ -17,20 +17,24 @@
 // Contact: Mohammad Najm <najm.devops@gmail.com>
 // https://github.com/najmdevstudio/Rustrainer_OCR
 
-//! Loads a PyTorch (`.pt` / `.pth`) state dict as a pretrained/fine-tuning starting point for
-//! [`CrnnOcr`].
+//! Loads a PyTorch (`.pt` / `.pth`) state dict as a pretrained/fine-tuning starting point,
+//! auto-detecting which of plate-ocr's two architectures it holds (see
+//! [`crate::model::architecture`]) from the tensor names it contains — a `lstm.weight_ih_l0`
+//! tensor means [`CrnnOcr`], its absence means [`ConvCtcOcr`].
 //!
-//! The convolutional backbone, batch-norm layers and final linear head are matched by name
+//! The convolutional backbone, batch-norm layers and FC/linear head(s) are matched by name
 //! automatically via [`burn_store::PytorchStore`] (which transposes linear weights and renames
-//! `weight`/`bias` to `gamma`/`beta` for norm layers). The BiLSTM is handled separately: PyTorch
-//! stores it as one combined matrix per gate-group (`lstm.weight_ih_l0`, ...) while Burn keeps
-//! every gate as an independent layer, so those tensors are split with
+//! `weight`/`bias` to `gamma`/`beta` for norm layers). `CrnnOcr`'s BiLSTM is handled separately:
+//! PyTorch stores it as one combined matrix per gate-group (`lstm.weight_ih_l0`, ...) while Burn
+//! keeps every gate as an independent layer, so those tensors are split with
 //! [`crate::interop::lstm_gates`] and injected directly as [`TensorSnapshot`]s.
 //!
-//! Expected PyTorch key names (matching the `CrnnOcr` PyTorch mirror in `export_onnx.py`):
-//! `conv{1..4}.{weight,bias}`, `bn{1..4}.{weight,bias,running_mean,running_var}`,
-//! `lstm.{weight_ih_l0,weight_hh_l0,bias_ih_l0,bias_hh_l0}` (+ `_reverse` variants),
-//! `linear.{weight,bias}`.
+//! Expected PyTorch key names (matching the PyTorch mirrors in `export_onnx.py`):
+//! - `CrnnOcr`: `conv{1..4}.{weight,bias}`, `bn{1..4}.{weight,bias,running_mean,running_var}`,
+//!   `lstm.{weight_ih_l0,weight_hh_l0,bias_ih_l0,bias_hh_l0}` (+ `_reverse` variants),
+//!   `linear.{weight,bias}`.
+//! - `ConvCtcOcr`: the same `conv{1..4}`/`bn{1..4}` keys, plus `fc1.{weight,bias}` and
+//!   `fc2.{weight,bias}` (no `lstm.*` keys).
 
 use std::path::Path;
 
@@ -39,18 +43,45 @@ use burn::prelude::*;
 use burn::tensor::{DType, TensorData};
 use burn_store::{ModuleSnapshot, ModuleStore, PytorchStore, TensorSnapshot};
 
+use crate::model::conv_ctc::{ConvCtcOcr, ConvCtcOcrConfig};
 use crate::model::crnn::{CrnnOcr, CrnnOcrConfig};
+use crate::model::OcrModel;
 
 use super::lstm_gates::{self, GateWeights};
 
-/// Loads a PyTorch state dict file into a freshly-initialized [`CrnnOcr`], for use as a
-/// fine-tuning starting point. `log` receives human-readable progress lines.
+/// Loads a PyTorch state dict file for use as a fine-tuning starting point, auto-detecting
+/// whether it is a [`CrnnOcr`] or a [`ConvCtcOcr`]. `log` receives human-readable progress lines.
 pub fn load<B: Backend>(
     path: &Path,
-    config: &CrnnOcrConfig,
     device: &B::Device,
     mut log: impl FnMut(String),
+) -> Result<OcrModel<B>, String> {
+    let mut store = PytorchStore::from_file(path).allow_partial(true);
+
+    let has_lstm = store
+        .get_snapshot("lstm.weight_ih_l0")
+        .ok()
+        .flatten()
+        .is_some();
+
+    if has_lstm {
+        log("PyTorch import: found 'lstm.weight_ih_l0' -> detected architecture: CRNN (Conv + BiLSTM + CTC).".to_string());
+        load_crnn::<B>(path, device, &mut store, &mut log).map(OcrModel::CrnnBiLstm)
+    } else {
+        log("PyTorch import: no 'lstm.weight_ih_l0' tensor -> detected architecture: Conv-CTC (Conv-only, no recurrent layer).".to_string());
+        load_conv_ctc::<B>(path, device, &mut store, &mut log).map(OcrModel::ConvCtc)
+    }
+}
+
+/// Loads the CNN backbone, BiLSTM (via manual gate-merging) and final linear layer into a fresh
+/// [`CrnnOcr`].
+fn load_crnn<B: Backend>(
+    path: &Path,
+    device: &B::Device,
+    store: &mut PytorchStore,
+    log: &mut impl FnMut(String),
 ) -> Result<CrnnOcr<B>, String> {
+    let config = CrnnOcrConfig::new();
     let mut model = config.init::<B>(device);
 
     // Expected LSTM shapes, taken from the freshly-initialized model (ground truth for this
@@ -58,10 +89,8 @@ pub fn load<B: Backend>(
     let hidden = config.lstm_hidden;
     let lstm_input = model.lstm_input_dim();
 
-    let mut store = PytorchStore::from_file(path).allow_partial(true);
-
     let result = model
-        .load_from(&mut store)
+        .load_from(store)
         .map_err(|e| format!("Failed to read PyTorch checkpoint '{}': {e}", path.display()))?;
     log(format!(
         "PyTorch import: matched {} tensor(s) by name (CNN backbone + classifier); {} skipped, {} left for the LSTM merge below.",
@@ -79,10 +108,10 @@ pub fn load<B: Backend>(
 
     let mut lstm_snapshots = Vec::new();
     for (direction, suffix) in [("forward", ""), ("reverse", "_reverse")] {
-        let weight_ih = read_f32(&mut store, &format!("lstm.weight_ih_l0{suffix}"), path)?;
-        let weight_hh = read_f32(&mut store, &format!("lstm.weight_hh_l0{suffix}"), path)?;
-        let bias_ih = read_f32(&mut store, &format!("lstm.bias_ih_l0{suffix}"), path)?;
-        let bias_hh = read_f32(&mut store, &format!("lstm.bias_hh_l0{suffix}"), path)?;
+        let weight_ih = read_f32(store, &format!("lstm.weight_ih_l0{suffix}"), path)?;
+        let weight_hh = read_f32(store, &format!("lstm.weight_hh_l0{suffix}"), path)?;
+        let bias_ih = read_f32(store, &format!("lstm.bias_ih_l0{suffix}"), path)?;
+        let bias_hh = read_f32(store, &format!("lstm.bias_hh_l0{suffix}"), path)?;
 
         let expected_ih_len = 4 * hidden * lstm_input;
         let expected_hh_len = 4 * hidden * hidden;
@@ -137,6 +166,52 @@ pub fn load<B: Backend>(
     Ok(model)
 }
 
+/// Loads the CNN backbone and 2-layer FC head into a fresh [`ConvCtcOcr`]. Since it has no
+/// recurrent layer to hand-merge, every tensor is matched by name directly.
+fn load_conv_ctc<B: Backend>(
+    path: &Path,
+    device: &B::Device,
+    store: &mut PytorchStore,
+    log: &mut impl FnMut(String),
+) -> Result<ConvCtcOcr<B>, String> {
+    let mut model = ConvCtcOcrConfig::new().init::<B>(device);
+
+    let result = model
+        .load_from(store)
+        .map_err(|e| format!("Failed to read PyTorch checkpoint '{}': {e}", path.display()))?;
+    log(format!(
+        "PyTorch import: matched {} tensor(s) by name (CNN backbone + FC head); {} skipped, {} missing.",
+        result.applied.len(),
+        result.skipped.len(),
+        result.missing.len(),
+    ));
+    if !result.errors.is_empty() {
+        return Err(format!(
+            "Errors while applying PyTorch weights to '{}': {:?}",
+            path.display(),
+            result.errors
+        ));
+    }
+    if !result.missing.is_empty() {
+        return Err(format!(
+            "'{}' is missing {} tensor(s) expected by plate-ocr's Conv-CTC architecture: {:?}. Make \
+             sure it is a plain state dict (e.g. saved via `torch.save(model.state_dict(), ...)`) \
+             using the same layer names as this project's Conv-CTC model (see `export_onnx.py`).",
+            path.display(),
+            result.missing.len(),
+            result.missing
+        ));
+    }
+
+    // `fc_input_dim` (unlike `CrnnOcr::lstm_input_dim`) doesn't need to be read here for manual
+    // shape validation: `load_from`'s by-name matching already validates every tensor's shape
+    // (including `fc1`'s) against the freshly-initialized model, since no hand-merged tensors
+    // are injected separately for this architecture.
+    let _ = model.fc_input_dim();
+
+    Ok(model)
+}
+
 fn read_f32(store: &mut PytorchStore, name: &str, path: &Path) -> Result<Vec<f32>, String> {
     let snapshot = store
         .get_snapshot(name)
@@ -174,16 +249,16 @@ mod cross_validation_tests {
     fn matches_real_pytorch_forward_pass() {
         let fixture_dir = std::path::Path::new("/tmp/plate_ocr_export_test");
         let device = Default::default();
-        let config = CrnnOcrConfig::new();
 
         let mut logs = Vec::new();
-        let model = load::<TestBackend>(&fixture_dir.join("direct.pt"), &config, &device, |line| {
-            logs.push(line)
-        })
-        .expect("failed to load direct.pt");
+        let model = load::<TestBackend>(&fixture_dir.join("direct.pt"), &device, |line| logs.push(line))
+            .expect("failed to load direct.pt");
         for line in &logs {
             println!("{line}");
         }
+        let OcrModel::CrnnBiLstm(model) = model else {
+            panic!("expected direct.pt to be auto-detected as CrnnBiLstm");
+        };
 
         let input_bytes = std::fs::read(fixture_dir.join("fixture_input.bin")).expect("missing fixture input");
         let input_f32: Vec<f32> = input_bytes

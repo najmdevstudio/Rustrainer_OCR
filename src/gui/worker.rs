@@ -29,9 +29,13 @@ use super::progress::GuiEvent;
 
 /// Spawns the training job in the background and reports the final outcome through `sender`
 /// (as a [`GuiEvent::Finished`]) once it completes or fails.
+///
+/// Anticipated failures (a bad `--pretrained` path, an unsupported architecture, missing Python
+/// dependencies, ...) come back as a plain `Err(message)` from `run_with_progress` itself; the
+/// `catch_unwind` below is a last-resort safety net for genuinely unexpected panics (e.g. a bug
+/// deep in tensor code) so the GUI always reaches the result screen instead of crashing outright.
 pub fn spawn_training(config: TrainConfig, sender: Sender<GuiEvent>) {
     thread::spawn(move || {
-        let output_dir = config.output_dir.clone();
         let renderer_sender = sender.clone();
 
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -40,14 +44,16 @@ pub fn spawn_training(config: TrainConfig, sender: Sender<GuiEvent>) {
                 config,
                 device,
                 Some(renderer_sender),
-            );
+            )
         }));
 
         let outcome = match result {
-            Ok(()) => Ok(format!(
-                "Training complete. Model saved to {output_dir}/plate_ocr_final"
+            Ok(Ok(message)) => Ok(message),
+            Ok(Err(message)) => Err(message),
+            Err(payload) => Err(format!(
+                "An unexpected internal error occurred: {}",
+                panic_message(payload)
             )),
-            Err(payload) => Err(panic_message(payload)),
         };
 
         let _ = sender.send(GuiEvent::Finished(outcome));

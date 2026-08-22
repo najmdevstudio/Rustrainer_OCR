@@ -18,9 +18,15 @@
 // https://github.com/najmdevstudio/Rustrainer_OCR
 
 //! Bridges pretrained models supplied in formats other than Burn's own checkpoint format
-//! (PyTorch `.pt`/`.pth` state dicts, or `.onnx` models) into a fresh [`CrnnOcr`], so they can
+//! (PyTorch `.pt`/`.pth` state dicts, or `.onnx` models) into a fresh [`OcrModel`], so they can
 //! be used as a fine-tuning starting point. Burn's native checkpoints (produced by earlier runs
 //! of this project) keep working exactly as before, unaffected by this module.
+//!
+//! Every format is auto-detected down to which of plate-ocr's supported
+//! [`Architecture`](crate::model::Architecture)s it holds — `.pt`/`.onnx` by inspecting the
+//! tensors/graph themselves, this project's own checkpoints via a small sidecar file (see
+//! `crate::model::architecture`) — so callers never need to know which one they're getting
+//! ahead of time; they can call [`OcrModel::architecture`] on the result instead.
 
 pub mod lstm_gates;
 mod onnx_import;
@@ -32,7 +38,9 @@ use burn::module::Module;
 use burn::prelude::*;
 use burn::record::CompactRecorder;
 
-use crate::model::crnn::{CrnnOcr, CrnnOcrConfig};
+use crate::model::conv_ctc::ConvCtcOcrConfig;
+use crate::model::crnn::CrnnOcrConfig;
+use crate::model::{Architecture, OcrModel};
 
 /// Loads `path` as a pretrained/fine-tuning starting point, auto-detecting the format from its
 /// file extension:
@@ -43,10 +51,9 @@ use crate::model::crnn::{CrnnOcr, CrnnOcrConfig};
 /// `log` receives human-readable progress lines, useful for surfacing in the CLI/GUI output.
 pub fn load_pretrained<B: Backend>(
     path: &str,
-    config: &CrnnOcrConfig,
     device: &B::Device,
     log: impl FnMut(String),
-) -> Result<CrnnOcr<B>, String> {
+) -> Result<OcrModel<B>, String> {
     let path_ref = Path::new(path);
     let extension = path_ref
         .extension()
@@ -54,13 +61,30 @@ pub fn load_pretrained<B: Backend>(
         .map(|ext| ext.to_ascii_lowercase());
 
     match extension.as_deref() {
-        Some("pt") | Some("pth") => pytorch_import::load::<B>(path_ref, config, device, log),
-        Some("onnx") => onnx_import::load::<B>(path_ref, config, device, log),
-        _ => {
-            let model = config.init::<B>(device);
-            model
+        Some("pt") | Some("pth") => pytorch_import::load::<B>(path_ref, device, log),
+        Some("onnx") => onnx_import::load::<B>(path_ref, device, log),
+        _ => load_burn_checkpoint::<B>(path, device),
+    }
+}
+
+/// Loads one of this project's own Burn checkpoints, picking the right model config based on
+/// the architecture sidecar file written alongside it by `crate::training::train` (defaulting to
+/// [`Architecture::CrnnBiLstm`] for checkpoints saved before that sidecar existed).
+fn load_burn_checkpoint<B: Backend>(path: &str, device: &B::Device) -> Result<OcrModel<B>, String> {
+    match Architecture::read_sidecar(path) {
+        Architecture::CrnnBiLstm => {
+            let model = CrnnOcrConfig::new()
+                .init::<B>(device)
                 .load_file(path, &CompactRecorder::new(), device)
-                .map_err(|e| format!("Failed to load Burn checkpoint '{path}': {e}"))
+                .map_err(|e| format!("Failed to load Burn checkpoint '{path}': {e}"))?;
+            Ok(OcrModel::CrnnBiLstm(model))
+        }
+        Architecture::ConvCtc => {
+            let model = ConvCtcOcrConfig::new()
+                .init::<B>(device)
+                .load_file(path, &CompactRecorder::new(), device)
+                .map_err(|e| format!("Failed to load Burn checkpoint '{path}': {e}"))?;
+            Ok(OcrModel::ConvCtc(model))
         }
     }
 }

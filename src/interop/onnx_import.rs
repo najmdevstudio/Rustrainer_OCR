@@ -33,7 +33,7 @@ use std::process::Command;
 
 use burn::prelude::*;
 
-use crate::model::crnn::{CrnnOcr, CrnnOcrConfig};
+use crate::model::OcrModel;
 
 use super::pytorch_import;
 
@@ -69,13 +69,12 @@ fn locate_helper_script() -> Result<PathBuf, String> {
 }
 
 /// Converts `path` (an `.onnx` file) to a temporary PyTorch state dict via the bundled Python
-/// helper, then loads it exactly like a native `.pt` file.
+/// helper, then loads it exactly like a native `.pt` file (auto-detecting its architecture).
 pub fn load<B: Backend>(
     path: &Path,
-    config: &CrnnOcrConfig,
     device: &B::Device,
     mut log: impl FnMut(String),
-) -> Result<CrnnOcr<B>, String> {
+) -> Result<OcrModel<B>, String> {
     let script = locate_helper_script()?;
     let tmp_pt = std::env::temp_dir().join(format!(
         "plate_ocr_onnx_import_{}_{}.pt",
@@ -86,9 +85,10 @@ pub fn load<B: Backend>(
             .unwrap_or(0)
     ));
 
-    // Allow overriding the interpreter (e.g. a virtualenv/pyenv/conda install that has
-    // 'onnx'/'numpy'/'torch') for setups where the default `python3` on PATH doesn't.
-    let python = std::env::var("PLATE_OCR_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let python = crate::pydeps::python_executable();
+    // Make sure numpy/onnx/torch are actually available before shelling out below — installs
+    // whichever are missing instead of letting import_onnx.py die on its first `import` line.
+    crate::pydeps::ensure_dependencies(&python, &mut log)?;
 
     log(format!(
         "Converting '{}' to a PyTorch state dict via {python} {}...",
@@ -116,15 +116,32 @@ pub fn load<B: Backend>(
     }
 
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for line in stderr.lines() {
+            log(format!("[import_onnx.py] {line}"));
+        }
         return Err(format!(
-            "import_onnx.py failed to convert '{}' (exit code {:?}):\n{}",
+            "import_onnx.py could not convert '{}': {}",
             path.display(),
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
+            summarize_python_error(&stderr)
         ));
     }
 
-    let result = pytorch_import::load::<B>(&tmp_pt, config, device, &mut log);
+    let result = pytorch_import::load::<B>(&tmp_pt, device, &mut log);
     let _ = std::fs::remove_file(&tmp_pt);
     result
+}
+
+/// Reduces a Python traceback down to its final exception line (e.g. `ValueError: ...` or
+/// `ModuleNotFoundError: No module named 'numpy'`) for a concise, front-and-center error message
+/// — the full traceback is still available above it since every stderr line is also sent to
+/// `log` before this is called.
+fn summarize_python_error(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .next_back()
+        .unwrap_or("(no error output captured; run with the terminal log open for details)")
+        .to_string()
 }

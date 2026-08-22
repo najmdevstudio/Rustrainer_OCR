@@ -19,6 +19,7 @@
 
 //! Editable training parameters shown on the "Parameters" screen.
 
+use crate::model::Architecture;
 use crate::training::train::TrainConfig;
 
 /// Which high-level flow the user picked on the first screen.
@@ -51,6 +52,10 @@ pub struct Params {
     /// format is auto-detected from the file extension (see `crate::interop`).
     pub pretrained: String,
     pub freeze_backbone: bool,
+    /// Which architecture to train from scratch. Only user-editable in [`Mode::NewTraining`];
+    /// [`Mode::FineTuning`] always auto-detects the architecture from `pretrained` instead (this
+    /// field is simply ignored in that case).
+    pub architecture: Architecture,
 }
 
 impl Params {
@@ -64,6 +69,7 @@ impl Params {
                 output_dir: "checkpoints".to_string(),
                 pretrained: String::new(),
                 freeze_backbone: false,
+                architecture: Architecture::CrnnBiLstm,
             },
             Mode::FineTuning => Self {
                 data_dir: "dataset".to_string(),
@@ -73,6 +79,7 @@ impl Params {
                 output_dir: "checkpoints".to_string(),
                 pretrained: "checkpoints/plate_ocr_final".to_string(),
                 freeze_backbone: false,
+                architecture: Architecture::CrnnBiLstm,
             },
         }
     }
@@ -117,5 +124,6 @@ impl Params {
             .with_output_dir(self.output_dir.clone())
             .with_pretrained(pretrained)
             .with_freeze_backbone(self.freeze_backbone)
+            .with_architecture(self.architecture)
     }
 }

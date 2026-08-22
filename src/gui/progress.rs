@@ -43,6 +43,9 @@ pub enum Phase {
 pub enum GuiEvent {
     /// A human readable line to append to the "terminal" output pane.
     Log(String),
+    /// Which model architecture was detected (fine-tuning) or selected (new training). Sent
+    /// once, before the training loop itself starts, so the GUI can show it up front.
+    Architecture(String),
     /// Overall progress across every epoch.
     Progress {
         epoch: usize,
